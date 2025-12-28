@@ -18,11 +18,31 @@ export default function BorangC8Page() {
   });
 
   useEffect(() => {
-    const client = getPB();
-    setPb(client);
+    try {
+      const client = getPB();
+      if (client) {
+        setPb(client);
+      } else {
+        setError("Failed to initialize database connection. Please refresh the page.");
+      }
+    } catch (err) {
+      console.error("Failed to initialize PocketBase:", err);
+      setError("Database connection error. Please refresh the page.");
+    }
   }, []);
 
   const handleChange = (field, value) => {
+    // Validate input before updating state
+    if (field === 'month') {
+      const monthVal = parseInt(value);
+      if (monthVal < 1 || monthVal > 12) return;
+    } else if (field === 'year') {
+      const yearVal = parseInt(value);
+      if (yearVal < 2020 || yearVal > 2030) return;
+    } else if (field === 'schoolName' && typeof value !== 'string') {
+      return;
+    }
+    
     setFormData(prev => ({ ...prev, [field]: value }));
   };
 
@@ -31,8 +51,15 @@ export default function BorangC8Page() {
   };
 
   const handleGenerate = async () => {
+    // Validate PocketBase client
     if (!pb) {
       setError("PocketBase client not initialized. Please refresh the page.");
+      return;
+    }
+
+    // Validate form data
+    if (!formData.schoolName || formData.schoolName.trim() === "") {
+      setError("School name is required.");
       return;
     }
 
@@ -41,81 +68,144 @@ export default function BorangC8Page() {
     setAttendanceData(null);
 
     try {
-      const year = formData.year;
-      const month = formData.month;
+      const year = parseInt(formData.year);
+      const month = parseInt(formData.month);
+
+      // Validate month and year
+      if (isNaN(month) || isNaN(year) || month < 1 || month > 12) {
+        throw new Error("Invalid month or year selected.");
+      }
+
       const daysInMonth = getDaysInMonth(month, year);
 
-      // Create date range for the month
-      const fromDate = new Date(year, month - 1, 1);
-      const toDate = new Date(year, month - 1, daysInMonth, 23, 59, 59);
+      // Fetch students and attendance with separate error handling
+      let students = [];
+      let attendance = [];
 
-      // Fetch students and attendance
-      const [students, attendance] = await Promise.all([
-        pb.collection("students").getFullList({ sort: "name" }),
-        pb.collection("attendance").getFullList({
-          filter: `date >= "${fromDate.toISOString()}" && date <= "${toDate.toISOString()}"`,
-          expand: "student"
-        })
-      ]);
+      try {
+        students = await pb.collection("students").getFullList({ sort: "name" });
+      } catch (err) {
+        console.error("Error fetching students:", err);
+        throw new Error("Failed to fetch student data. Please try again.");
+      }
 
-      // Create attendance matrix
+      if (!students || students.length === 0) {
+        setError("No students found in the system.");
+        setLoading(false);
+        return;
+      }
+
+      try {
+        attendance = await pb.collection("attendance").getFullList({
+          sort: "date"
+        });
+      } catch (err) {
+        console.error("Error fetching attendance:", err);
+        // Don't fail if attendance fetch fails, just continue with empty attendance
+        attendance = [];
+      }
+
+      // Create attendance matrix with validation
       const attendanceMatrix = {};
       students.forEach(student => {
-        attendanceMatrix[student.id] = {
-          name: student.name,
-          class: student.class || "-",
-          days: Array(daysInMonth).fill(null)
-        };
-      });
-
-      // Fill in attendance data - X means present
-      // FIXED: Now checks for present === true instead of status field
-      attendance.forEach(record => {
-        const studentId = record.student;
-        const date = new Date(record.date);
-        const day = date.getDate() - 1; // 0-indexed
-        
-        if (attendanceMatrix[studentId]) {
-          // Mark as X (present) if the record exists and present is true
-          if (record.present === true) {
-            attendanceMatrix[studentId].days[day] = "X";
-          }
+        if (student && student.id) {
+          attendanceMatrix[student.id] = {
+            name: (student.name || "Unknown").trim(),
+            class: (student.class || "-").trim(),
+            days: Array(daysInMonth).fill(null)
+          };
         }
       });
 
-      // Calculate totals - X = present, null = absent
-      // FIXED: Changed from "O" to "X" to match the marking above
-      const studentsWithTotals = Object.entries(attendanceMatrix).map(([id, data]) => {
-        const present = data.days.filter(d => d === "X").length; // X = present (FIXED)
-        const absent = data.days.filter(d => d === null).length; // null = absent
-        return {
-          id,
-          name: data.name,
-          class: data.class,
-          days: data.days,
-          present,
-          absent,
-          total: present + absent
-        };
-      });
+      // Fill in attendance data with proper validation
+      if (Array.isArray(attendance)) {
+        attendance.forEach(record => {
+          // Validate record structure
+          if (!record || typeof record !== 'object') return;
+
+          const studentId = record.student;
+          if (!studentId || !attendanceMatrix[studentId]) return;
+
+          try {
+            const recordDate = new Date(record.date);
+            
+            // Validate date
+            if (isNaN(recordDate.getTime())) return;
+            
+            const recordMonth = recordDate.getMonth() + 1;
+            const recordYear = recordDate.getFullYear();
+            
+            // Only process records from the selected month/year
+            if (recordMonth === month && recordYear === year) {
+              const day = recordDate.getDate() - 1; // 0-indexed
+              
+              // Validate day index
+              if (day >= 0 && day < daysInMonth) {
+                // Mark as X (present) if present is explicitly true
+                if (record.present === true) {
+                  attendanceMatrix[studentId].days[day] = "X";
+                }
+              }
+            }
+          } catch (err) {
+            console.warn("Error processing attendance record:", record, err);
+            // Skip malformed records
+          }
+        });
+      }
+
+      // Calculate totals with validation
+      const studentsWithTotals = Object.entries(attendanceMatrix)
+        .map(([id, data]) => {
+          const present = data.days.filter(d => d === "X").length;
+          const absent = data.days.filter(d => d === null).length;
+          return {
+            id,
+            name: data.name,
+            class: data.class,
+            days: data.days,
+            present,
+            absent,
+            total: present + absent
+          };
+        })
+        .sort((a, b) => a.name.localeCompare(b.name)); // Ensure consistent sorting
+
+      if (studentsWithTotals.length === 0) {
+        throw new Error("No valid student data available.");
+      }
+
+      // Calculate summary
+      const totalPresent = studentsWithTotals.reduce((sum, s) => sum + s.present, 0);
+      const totalAbsent = studentsWithTotals.reduce((sum, s) => sum + s.absent, 0);
 
       setAttendanceData({
         students: studentsWithTotals,
         daysInMonth,
-        totalStudents: students.length,
-        totalPresent: studentsWithTotals.reduce((sum, s) => sum + s.present, 0),
-        totalAbsent: studentsWithTotals.reduce((sum, s) => sum + s.absent, 0)
+        totalStudents: studentsWithTotals.length,
+        totalPresent,
+        totalAbsent,
+        generatedAt: new Date().toISOString()
       });
     } catch (err) {
       console.error("Error generating report:", err);
-      setError("Failed to generate report. " + (err.message || "Unknown error"));
+      setError(err.message || "Failed to generate report. Please try again.");
     } finally {
       setLoading(false);
     }
   };
 
   const handlePrint = () => {
-    window.print();
+    if (!attendanceData || !attendanceData.students || attendanceData.students.length === 0) {
+      setError("No valid data to print. Please generate a report first.");
+      return;
+    }
+    try {
+      window.print();
+    } catch (err) {
+      console.error("Print error:", err);
+      setError("Failed to open print dialog.");
+    }
   };
 
   const monthNames = [
